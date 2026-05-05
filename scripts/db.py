@@ -20,16 +20,35 @@ def insert_paper(cursor, paper):
     ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id)
     """
 
-    cursor.execute(query, (
-        paper["paper_id"],
-        paper["title"],
-        paper["abstract"],
-        paper["primary_subject"],
-        paper["submission_info"],
-        paper["url"]
-    ))
-
-    return cursor.lastrowid
+    try:
+        print(f"[DB_DEBUG] Inserting paper: {paper.get('paper_id', 'N/A')}")
+        print(f"[DB_DEBUG] Title length: {len(paper.get('title', ''))}")
+        print(f"[DB_DEBUG] Abstract length: {len(paper.get('abstract', ''))}")
+        
+        cursor.execute(query, (
+            paper["paper_id"],
+            paper["title"],
+            paper["abstract"],
+            paper["primary_subject"],
+            paper["submission_info"],
+            paper["url"]
+        ))
+        
+        paper_id = cursor.lastrowid
+        print(f"[DB_DEBUG] Insert executed, returned paper_id: {paper_id}")
+        
+        # Check if this was an insert or update
+        cursor.execute("SELECT ROW_COUNT()")
+        row_count = cursor.fetchone()[0]
+        print(f"[DB_DEBUG] Row count: {row_count}")
+        
+        return paper_id
+        
+    except Exception as e:
+        print(f"[DB_DEBUG] Insert failed: {e}")
+        print(f"[DB_DEBUG] Query: {query}")
+        print(f"[DB_DEBUG] Data: paper_id={paper.get('paper_id', 'N/A')}, title={paper.get('title', 'N/A')[:30]}...")
+        raise
 
 
 # ------------------ AUTHORS ------------------
