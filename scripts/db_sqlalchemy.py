@@ -253,30 +253,47 @@ def insert_arxiv_stats(paper_id: int, stats: Dict) -> bool:
 # ==================== GENERAL CRAWLER FUNCTIONS (new SQLAlchemy-based) ====================
 
 def insert_paper(paper_data: Dict) -> Optional[int]:
-    """Insert or update a general paper using SQLAlchemy"""
+    """Insert or update a general paper using SQLAlchemy with string truncation"""
     session = get_db_session()
     try:
+        # Truncate strings to fit database schema constraints
+        truncated_data = {}
+        for key, value in paper_data.items():
+            if isinstance(value, str):
+                if key == 'url':
+                    truncated_data[key] = value[:2048]  # VARCHAR(2048)
+                elif key == 'title':
+                    truncated_data[key] = value[:1000]  # VARCHAR(1000)
+                elif key == 'content_hash':
+                    truncated_data[key] = value[:64]  # VARCHAR(64)
+                elif key == 'domain':
+                    truncated_data[key] = value[:255]  # VARCHAR(255)
+                else:
+                    truncated_data[key] = value
+            else:
+                truncated_data[key] = value
+        
         # Check if paper already exists by URL or content_hash
         existing_paper = session.query(Paper).filter(
-            (Paper.url == paper_data["url"]) | 
-            (Paper.content_hash == paper_data.get("content_hash"))
+            (Paper.url == truncated_data["url"]) | 
+            (Paper.content_hash == truncated_data.get("content_hash"))
         ).first()
         
         if existing_paper:
             # Update existing paper
-            for key, value in paper_data.items():
+            for key, value in truncated_data.items():
                 if hasattr(existing_paper, key):
                     setattr(existing_paper, key, value)
             paper_id = existing_paper.id
         else:
             # Create new paper
-            new_paper = Paper(**paper_data)
+            new_paper = Paper(**truncated_data)
             session.add(new_paper)
             session.flush()
             paper_id = new_paper.id
         
         session.commit()
-        logger.debug(f"Inserted/updated paper {paper_data.get('url', 'unknown')} with ID {paper_id}")
+        logger.debug(f"Inserted/updated paper {truncated_data.get('url', 'unknown')} with ID {paper_id}")
         return paper_id
         
     except Exception as e:
@@ -408,17 +425,21 @@ def insert_stats(paper_id: int, stats: Dict) -> bool:
         session.close()
 
 def insert_discovered_link(source_url: str, target_url: str, anchor_text: str = "") -> bool:
-    """Insert a discovered link"""
+    """Insert a discovered link with string truncation to fit schema"""
     session = get_db_session()
     try:
+        # Truncate strings to fit database schema constraints
+        # anchor_text is VARCHAR(500) in schema
+        truncated_anchor_text = anchor_text[:500] if anchor_text else ""
+        
         new_link = DiscoveredLink(
-            source_url=source_url,
-            target_url=target_url,
-            anchor_text=anchor_text
+            source_url=source_url[:2048],  # VARCHAR(2048)
+            target_url=target_url[:2048],  # VARCHAR(2048)
+            anchor_text=truncated_anchor_text
         )
         session.add(new_link)
         session.commit()
-        logger.debug(f"Inserted discovered link: {source_url} -> {target_url}")
+        logger.debug(f"Inserted discovered link: {source_url[:100]}... -> {target_url[:100]}...")
         return True
         
     except Exception as e:

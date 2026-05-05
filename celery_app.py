@@ -9,10 +9,10 @@ import os
 
 # Celery configuration
 CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0')
-CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://localhost:6379/1')
+CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'rpc://')
 
-# Create Celery app
-app = Celery('distributed_crawler')
+# Create Celery app with auto-discovery
+app = Celery('distributed_crawler', include=['crawler_tasks'])
 
 # Configure Celery
 app.conf.update(
@@ -28,7 +28,8 @@ app.conf.update(
     task_routes={
         'crawler_tasks.crawl_page': {'queue': 'crawling'},
         'crawler_tasks.process_arxiv_paper': {'queue': 'arxiv'},
-        'crawler_tasks.analyze_content': {'queue': 'analysis'},
+        'crawler_tasks.batch_crawl': {'queue': 'crawling'},
+        'crawler_tasks.analyze_content': {'queue': 'analysis'}
     },
     
     # Queue definitions

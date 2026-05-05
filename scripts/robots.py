@@ -13,7 +13,15 @@ class RobotsCache:
     """Cache for robots.txt files with expiration"""
     
     def __init__(self, redis_client):
-        self.r = redis_client
+        # Create a separate Redis client for binary data (no decode_responses)
+        self.r_binary = redis.Redis(
+            host=redis_client.connection_pool.connection_kwargs.get('host', 'localhost'),
+            port=redis_client.connection_pool.connection_kwargs.get('port', 6379),
+            db=redis_client.connection_pool.connection_kwargs.get('db', 0),
+            password=redis_client.connection_pool.connection_kwargs.get('password'),
+            decode_responses=False  # Keep binary data for consistency
+        )
+        self.r = redis_client  # Keep original client for string operations
         self.default_delay = 1.0  # Default 1 second delay
         self.cache_duration = 86400  # 24 hours cache duration
     
@@ -22,8 +30,8 @@ class RobotsCache:
         parsed_url = urlparse(url)
         domain = parsed_url.netloc
         
-        # Check cache first
-        cached_data = self.r.hgetall(f"robots:{domain}")
+        # Check cache first (using binary client)
+        cached_data = self.r_binary.hgetall(f"robots:{domain}")
         
         if cached_data:
             # Check if cache is still valid
@@ -39,7 +47,7 @@ class RobotsCache:
                 return parser
             else:
                 # Cache expired, remove it
-                self.r.delete(f"robots:{domain}")
+                self.r_binary.delete(f"robots:{domain}")
         
         # Fetch fresh robots.txt
         return self._fetch_robots_txt(domain)
@@ -59,11 +67,11 @@ class RobotsCache:
                 parser.set_url(robots_url)
                 parser.parse(content.splitlines())
                 
-                # Cache the result
+                # Cache the result (using binary client for consistency)
                 expires_at = time.time() + self.cache_duration
-                self.r.hset(f"robots:{domain}", mapping={
-                    'content': content,
-                    'expires_at': str(expires_at)
+                self.r_binary.hset(f"robots:{domain}", mapping={
+                    b'content': content.encode('utf-8'),
+                    b'expires_at': str(expires_at).encode('utf-8')
                 })
                 
                 logger.info(f"Cached robots.txt for {domain}")
@@ -93,35 +101,52 @@ class RobotsCache:
 
 
 class RateLimiter:
-    """Distributed rate limiter using Redis"""
+    """Distributed rate limiter using Redis with atomic operations"""
     
     def __init__(self, redis_client):
         self.r = redis_client
     
     def acquire(self, domain, delay=1.0):
-        """Acquire permission to crawl a domain, respecting delay"""
+        """Acquire permission to crawl a domain, respecting delay using atomic operations"""
         key = f"rate_limit:{domain}"
+        lock_key = f"rate_limit_lock:{domain}"
         
         while True:
             now = time.time()
-            last_request = self.r.get(key)
             
-            if last_request is None:
-                # First request for this domain
-                self.r.set(key, now)
-                return
+            # Try to acquire distributed lock
+            lock_acquired = self.r.set(lock_key, "locked", nx=True, ex=5)
             
-            elapsed = now - float(last_request)
-            
-            if elapsed >= delay:
-                # Enough time has passed
-                self.r.set(key, now)
-                return
-            
-            # Wait for the remaining time
-            sleep_time = delay - elapsed
-            logger.info(f"Rate limiting {domain}: waiting {sleep_time:.2f}s")
-            time.sleep(sleep_time)
+            if lock_acquired:
+                try:
+                    # We have the lock, check rate limit atomically
+                    last_request = self.r.get(key)
+                    
+                    if last_request is None:
+                        # First request for this domain
+                        self.r.set(key, now)
+                        return
+                    
+                    elapsed = now - float(last_request)
+                    
+                    if elapsed >= delay:
+                        # Enough time has passed
+                        self.r.set(key, now)
+                        return
+                    
+                    # Calculate wait time
+                    sleep_time = delay - elapsed
+                    logger.info(f"Rate limiting {domain}: waiting {sleep_time:.2f}s")
+                    
+                finally:
+                    # Release the lock
+                    self.r.delete(lock_key)
+                
+                # Wait outside the lock to avoid blocking others
+                time.sleep(sleep_time)
+            else:
+                # Failed to acquire lock, wait briefly and retry
+                time.sleep(0.1)
 
 
 def check_robots_and_wait(url, redis_client, user_agent='*'):

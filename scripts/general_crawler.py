@@ -9,6 +9,7 @@ import logging
 from fake_useragent import UserAgent
 from robots import check_robots_and_wait
 from bloom_filter import DuplicateDetector
+import redis
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

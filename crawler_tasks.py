@@ -1,30 +1,29 @@
 """
 Celery tasks for distributed web crawler
-Refactors crawl_page function and other operations into Celery tasks
+Moves crawling orchestration from manual Redis loops to proper Celery tasks
 """
 
 import sys
 import time
 import logging
 from pathlib import Path
-from celery import current_task
-from celery.exceptions import Retry
+from typing import Dict, Any, Optional
+from datetime import datetime
 
 # Add scripts directory to path
 sys.path.append(str(Path(__file__).parent / "scripts"))
 
 from celery_app import app
+from config import ConfigManager
+from logger import init_logger, get_logger
 from general_crawler import GeneralWebCrawler
 from db_sqlalchemy import (
-    insert_paper, insert_keyword, link_paper_keyword,
-    insert_stats, insert_discovered_link,
+    insert_paper, insert_keyword, link_paper_keyword, insert_stats, insert_discovered_link,
     insert_arxiv_paper, insert_arxiv_author, link_arxiv_paper_author,
-    insert_arxiv_subject, link_arxiv_paper_subject,
-    insert_arxiv_keyword, link_arxiv_paper_keyword, insert_arxiv_stats
+    insert_arxiv_subject, link_arxiv_paper_subject, insert_arxiv_keyword, 
+    link_arxiv_paper_keyword, insert_arxiv_stats
 )
-from utils import parse_abstract, extract_keywords, compute_stats
-from url_queue import QueueManager
-from logger import init_logger
+from utils import parse_abstract
 from robots import check_robots_and_wait
 import redis
 
@@ -32,22 +31,37 @@ import redis
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Redis client for coordination
-redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+# Global Redis client for rate limiting
+redis_client = redis.Redis(
+    host='localhost',
+    port=6379,
+    db=0,
+    decode_responses=True
+)
 
-@app.task(bind=True, name='crawler_tasks.crawl_page', max_retries=3)
-def crawl_page_task(self, url, worker_id=None):
+@app.task(
+    bind=True, 
+    name='crawler_tasks.crawl_page', 
+    max_retries=3,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_backoff_max=60,
+    retry_jitter=True
+)
+def crawl_page_task(self, url: str, worker_id: Optional[str] = None):
     """
     Celery task to crawl a single web page
-    Replaces the crawl_page function from general_crawler.py
+    Replaces manual crawling logic from worker.py
     """
     task_id = self.request.id
     worker_id = worker_id or f"celery-{task_id[:8]}"
     
     try:
         # Initialize components
-        crawler_logger = init_logger(redis_client)
-        crawler = GeneralWebCrawler(redis_client)
+        config_manager = ConfigManager()
+        config = config_manager.config
+        crawler_logger = init_logger(redis_client, config.logging.__dict__)
+        crawler = GeneralWebCrawler(redis_client, config.crawler.__dict__)
         
         crawler_logger.log_crawl_start(url, worker_id)
         
@@ -62,7 +76,7 @@ def crawl_page_task(self, url, worker_id=None):
             crawler_logger.log_crawl_error(url, worker_id, "Blocked by robots.txt")
             return {'status': 'failed', 'error': 'Blocked by robots.txt', 'url': url}
         
-        # Crawl the page
+        # Crawl page
         start_time = time.time()
         result = crawler.crawl_page(url)
         
@@ -74,8 +88,7 @@ def crawl_page_task(self, url, worker_id=None):
         paper_id = store_crawled_data(result, worker_id)
         
         # Add discovered URLs to queue
-        queue_manager = QueueManager(redis_client)
-        new_urls = queue_manager.add_urls_from_page(result)
+        new_urls = len(result.get('links', []))
         
         # Log success
         duration = time.time() - start_time
@@ -110,13 +123,7 @@ def crawl_page_task(self, url, worker_id=None):
     except Exception as exc:
         logger.error(f"Error crawling {url}: {exc}")
         
-        # Retry with exponential backoff
-        if self.request.retries < self.max_retries:
-            countdown = 2 ** self.request.retries  # Exponential backoff
-            logger.info(f"Retrying crawl of {url} in {countdown} seconds (attempt {self.request.retries + 1})")
-            raise self.retry(countdown=countdown, exc=exc)
-        
-        # Log final failure
+        # Log final failure if max retries reached
         crawler_logger = init_logger(redis_client)
         crawler_logger.log_crawl_error(url, worker_id, str(exc))
         
@@ -127,145 +134,188 @@ def crawl_page_task(self, url, worker_id=None):
             'retries': self.request.retries
         }
 
-@app.task(bind=True, name='crawler_tasks.process_arxiv_paper', max_retries=3)
-def process_arxiv_paper_task(self, paper_id, worker_id=None):
+@app.task(
+    bind=True, 
+    name='crawler_tasks.process_arxiv_paper', 
+    max_retries=3,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_backoff_max=60,
+    retry_jitter=True
+)
+def process_arxiv_paper_task(self, url: str, worker_id: Optional[str] = None):
     """
-    Celery task to process an arXiv paper
-    Replaces the arXiv worker functionality
+    Celery task to process ArXiv paper
+    Uses specialized ArXiv scraper with centralized rate limiting
     """
     task_id = self.request.id
     worker_id = worker_id or f"celery-{task_id[:8]}"
     
     try:
+        # Extract paper ID from URL
+        paper_id = extract_arxiv_id(url)
+        if not paper_id:
+            return {'status': 'failed', 'error': 'Could not extract ArXiv paper ID', 'url': url}
+        
         # Initialize logger
         crawler_logger = init_logger(redis_client)
-        
-        crawler_logger.log_worker_event(worker_id, 'START', f"Processing arXiv paper {paper_id}")
+        crawler_logger.log_crawl_start(url, worker_id)
         
         # Update task state
         self.update_state(
             state='PROGRESS',
-            meta={'status': 'Parsing paper', 'paper_id': paper_id, 'worker_id': worker_id}
+            meta={'status': 'Starting ArXiv processing', 'url': url, 'worker_id': worker_id}
         )
         
-        # Parse arXiv paper
+        # Check robots.txt and rate limiting
+        if not check_robots_and_wait(url, redis_client):
+            crawler_logger.log_crawl_error(url, worker_id, "Blocked by robots.txt")
+            return {'status': 'failed', 'error': 'Blocked by robots.txt', 'url': url}
+        
+        # Parse ArXiv paper
+        start_time = time.time()
         paper_data = parse_abstract(paper_id, redis_client)
         
         if not paper_data:
-            crawler_logger.log_crawl_error(f"arxiv:{paper_id}", worker_id, "Failed to parse paper")
-            return {'status': 'failed', 'error': 'Failed to parse paper', 'paper_id': paper_id}
+            crawler_logger.log_crawl_error(url, worker_id, "Failed to parse ArXiv paper")
+            return {'status': 'failed', 'error': 'Failed to parse ArXiv paper', 'url': url}
         
-        # Store paper data
-        paper_db_id = store_arxiv_data(paper_data, worker_id)
+        # Store ArXiv data
+        paper_id_db = store_arxiv_data(paper_data, worker_id)
+        
+        if paper_id_db:
+            # Log success
+            duration = time.time() - start_time
+            crawler_logger.log_crawl_success(url, worker_id, {'word_count': paper_data.get('word_count', 0)})
+            crawler_logger.log_performance('process_arxiv_paper', duration, {
+                'url': url,
+                'worker_id': worker_id,
+                'paper_id': paper_id_db
+            })
+            
+            # Update task state
+            self.update_state(
+                state='SUCCESS',
+                meta={
+                    'status': 'completed',
+                    'url': url,
+                    'paper_id': paper_id_db,
+                    'duration': duration
+                }
+            )
+            
+            return {
+                'status': 'completed',
+                'url': url,
+                'paper_id': paper_id_db,
+                'duration': duration,
+                'worker_id': worker_id
+            }
+        else:
+            crawler_logger.log_crawl_error(url, worker_id, "Failed to store ArXiv data")
+            return {'status': 'failed', 'error': 'Failed to store ArXiv data', 'url': url}
+            
+    except Exception as exc:
+        logger.error(f"Error processing ArXiv paper {url}: {exc}")
+        
+        # Log final failure if max retries reached
+        crawler_logger = init_logger(redis_client)
+        crawler_logger.log_crawl_error(url, worker_id, str(exc))
+        
+        return {
+            'status': 'failed',
+            'error': str(exc),
+            'url': url,
+            'retries': self.request.retries
+        }
+
+@app.task(
+    bind=True, 
+    name='crawler_tasks.batch_crawl', 
+    max_retries=1,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_backoff_max=30,
+    retry_jitter=True
+)
+def batch_crawl_task(self, urls: list, worker_id: Optional[str] = None):
+    """
+    Celery task to crawl multiple URLs in batch
+    """
+    task_id = self.request.id
+    worker_id = worker_id or f"celery-{task_id[:8]}"
+    
+    try:
+        results = []
+        
+        # Update task state
+        self.update_state(
+            state='PROGRESS',
+            meta={'status': 'Starting batch crawl', 'total_urls': len(urls), 'worker_id': worker_id}
+        )
+        
+        for i, url in enumerate(urls):
+            # Route URL based on type
+            if is_arxiv_url(url):
+                result = process_arxiv_paper_task.apply_async(args=[url, worker_id])
+            else:
+                result = crawl_page_task.apply_async(args=[url, worker_id])
+            
+            results.append({
+                'url': url,
+                'task_id': result.id,
+                'index': i
+            })
         
         # Update task state
         self.update_state(
             state='SUCCESS',
             meta={
-                'status': 'completed',
-                'paper_id': paper_id,
-                'paper_db_id': paper_db_id,
+                'status': 'batch submitted',
+                'total_urls': len(urls),
+                'results': results,
                 'worker_id': worker_id
             }
         )
         
-        crawler_logger.log_worker_event(worker_id, 'COMPLETE', f"Processed arXiv paper {paper_id}")
-        
         return {
-            'status': 'completed',
-            'paper_id': paper_id,
-            'paper_db_id': paper_db_id,
+            'status': 'batch_submitted',
+            'total_urls': len(urls),
+            'results': results,
             'worker_id': worker_id
         }
         
     except Exception as exc:
-        logger.error(f"Error processing arXiv paper {paper_id}: {exc}")
-        
-        # Retry with exponential backoff
-        if self.request.retries < self.max_retries:
-            countdown = 2 ** self.request.retries
-            logger.info(f"Retrying arXiv paper {paper_id} in {countdown} seconds")
-            raise self.retry(countdown=countdown, exc=exc)
+        logger.error(f"Error in batch crawl: {exc}")
         
         return {
             'status': 'failed',
             'error': str(exc),
-            'paper_id': paper_id,
             'retries': self.request.retries
         }
 
-@app.task(name='crawler_tasks.batch_crawl')
-def batch_crawl_task(urls, worker_id=None):
-    """
-    Celery task to crawl multiple URLs in batch
-    """
-    results = []
-    
-    for url in urls:
-        try:
-            result = crawl_page_task.delay(url, worker_id)
-            results.append(result)
-        except Exception as e:
-            logger.error(f"Error queuing crawl for {url}: {e}")
-    
-    return {
-        'status': 'queued',
-        'queued_tasks': len(results),
-        'task_ids': [result.id for result in results]
-    }
+# Helper functions
+def is_arxiv_url(url: str) -> bool:
+    """Check if URL is an ArXiv URL"""
+    return 'arxiv.org' in url.lower()
 
-@app.task(name='crawler_tasks.analyze_content')
-def analyze_content_task(paper_id, worker_id=None):
-    """
-    Celery task to analyze crawled content
-    """
+def extract_arxiv_id(url: str) -> Optional[str]:
+    """Extract ArXiv paper ID from URL"""
+    import re
+    # Match patterns like /abs/2301.12345 or /pdf/2301.12345.pdf
+    match = re.search(r'/abs/(\d+\.\d+)', url)
+    if match:
+        return match.group(1)
+    return None
+
+def store_crawled_data(result: Dict[str, Any], worker_id: str) -> Optional[int]:
+    """Store crawled data using SQLAlchemy with resilient transactions"""
+    session = None
     try:
-        from db_sqlalchemy import get_db_session
-        from models import Paper
-        
+        # Get database session
+        from models import get_db_session
         session = get_db_session()
-        paper = session.query(Paper).filter_by(id=paper_id).first()
         
-        if not paper:
-            return {'status': 'failed', 'error': 'Paper not found', 'paper_id': paper_id}
-        
-        # Perform content analysis
-        analysis = {
-            'word_count': len(paper.content.split()) if paper.content else 0,
-            'keyword_density': {},
-            'readability_score': calculate_readability(paper.content) if paper.content else 0
-        }
-        
-        # Extract keyword density
-        if paper.content:
-            from collections import Counter
-            words = paper.content.lower().split()
-            word_freq = Counter(words)
-            total_words = len(words)
-            
-            for word, count in word_freq.most_common(10):
-                analysis['keyword_density'][word] = (count / total_words) * 100
-        
-        session.close()
-        
-        return {
-            'status': 'completed',
-            'paper_id': paper_id,
-            'analysis': analysis,
-            'worker_id': worker_id
-        }
-        
-    except Exception as e:
-        logger.error(f"Error analyzing content for paper {paper_id}: {e}")
-        return {
-            'status': 'failed',
-            'error': str(e),
-            'paper_id': paper_id
-        }
-
-def store_crawled_data(result, worker_id):
-    """Store crawled data using SQLAlchemy"""
-    try:
         # Prepare paper data
         paper_data = {
             'url': result['url'],
@@ -273,38 +323,47 @@ def store_crawled_data(result, worker_id):
             'content': result['content'],
             'content_hash': result['content_hash'],
             'domain': result['metadata']['domain'],
-            'status': 'completed',
+            'status': 'COMPLETED',  # Fix: Use uppercase enum value
             'priority': 50,
-            'crawl_date': result['crawl_date']
+            'crawl_date': datetime.fromtimestamp(result['crawl_date'])
         }
         
-        # Insert main paper
+        # Insert main paper (this must succeed)
         paper_id = insert_paper(paper_data)
         
         if paper_id:
-            # Insert keywords and link them
+            # Insert keywords and link them (resilient - failures won't roll back main paper)
             for keyword in result['keywords']:
-                keyword_id = insert_keyword(keyword)
-                if keyword_id:
-                    link_paper_keyword(paper_id, keyword_id)
+                try:
+                    keyword_id = insert_keyword(keyword)
+                    if keyword_id:
+                        link_paper_keyword(paper_id, keyword_id)
+                except Exception as e:
+                    logger.warning(f"Worker {worker_id}: Failed to insert keyword '{keyword}': {e}")
             
-            # Insert statistics
-            stats_data = {
-                'word_count': result['stats']['word_count'],
-                'content_length': result['stats']['content_length'],
-                'title_length': result['stats']['title_length'],
-                'num_keywords': result['stats']['num_keywords'],
-                'num_links': result['stats']['num_links']
-            }
-            insert_stats(paper_id, stats_data)
+            # Insert statistics (resilient)
+            try:
+                stats_data = {
+                    'word_count': result['stats']['word_count'],
+                    'content_length': result['stats']['content_length'],
+                    'title_length': result['stats']['title_length'],
+                    'num_keywords': result['stats']['num_keywords'],
+                    'num_links': result['stats']['num_links']
+                }
+                insert_stats(paper_id, stats_data)
+            except Exception as e:
+                logger.warning(f"Worker {worker_id}: Failed to insert stats: {e}")
             
-            # Insert discovered links
-            for link_data in result['links']:
-                insert_discovered_link(
-                    result['url'],
-                    link_data['url'],
-                    link_data['anchor_text']
-                )
+            # Insert discovered links (resilient)
+            for link_data in result.get('links', []):
+                try:
+                    insert_discovered_link(
+                        result['url'],
+                        link_data['url'],
+                        link_data['anchor_text']
+                    )
+                except Exception as e:
+                    logger.warning(f"Worker {worker_id}: Failed to insert discovered link: {e}")
             
             logger.info(f"Worker {worker_id}: Successfully stored data for {result['url']}")
             return paper_id
@@ -313,104 +372,73 @@ def store_crawled_data(result, worker_id):
             return None
             
     except Exception as e:
-        logger.error(f"Worker {worker_id}: Error storing data: {e}")
+        logger.error(f"Worker {worker_id}: Database error storing data for {result.get('url', 'unknown')}: {e}")
         return None
+    finally:
+        if session:
+            session.close()
 
-def store_arxiv_data(paper_data, worker_id):
-    """Store arXiv paper data using SQLAlchemy"""
+def store_arxiv_data(paper_data: Dict, worker_id: str) -> Optional[int]:
+    """Store ArXiv paper data using SQLAlchemy with resilient transactions"""
+    session = None
     try:
-        # Insert main paper
+        # Get database session
+        from models import get_arxiv_db_session
+        session = get_arxiv_db_session()
+        
+        # Insert main paper (this must succeed)
         paper_id = insert_arxiv_paper(paper_data)
         
         if paper_id:
-            # Insert and link authors
+            # Insert and link authors (resilient)
             for author in paper_data.get('authors', []):
-                author_id = insert_arxiv_author(author)
-                if author_id:
-                    link_arxiv_paper_author(paper_id, author_id)
+                try:
+                    author_id = insert_arxiv_author(author)
+                    if author_id:
+                        link_arxiv_paper_author(paper_id, author_id)
+                except Exception as e:
+                    logger.warning(f"Worker {worker_id}: Failed to insert author '{author}': {e}")
             
-            # Insert and link subjects
+            # Insert and link subjects (resilient)
             for subject in paper_data.get('subjects', []):
-                subject_id = insert_arxiv_subject(subject)
-                if subject_id:
-                    link_arxiv_paper_subject(paper_id, subject_id)
+                try:
+                    subject_id = insert_arxiv_subject(subject)
+                    if subject_id:
+                        link_arxiv_paper_subject(paper_id, subject_id)
+                except Exception as e:
+                    logger.warning(f"Worker {worker_id}: Failed to insert subject '{subject}': {e}")
             
-            # Extract and link keywords
-            keywords = extract_keywords(paper_data.get('abstract', ''))
-            for keyword in keywords:
-                keyword_id = insert_arxiv_keyword(keyword)
-                if keyword_id:
-                    link_arxiv_paper_keyword(paper_id, keyword_id)
+            # Insert and link keywords (resilient)
+            for keyword in paper_data.get('keywords', []):
+                try:
+                    keyword_id = insert_arxiv_keyword(keyword)
+                    if keyword_id:
+                        link_arxiv_paper_keyword(paper_id, keyword_id)
+                except Exception as e:
+                    logger.warning(f"Worker {worker_id}: Failed to insert keyword '{keyword}': {e}")
             
-            # Insert statistics
-            stats = compute_stats(paper_data)
-            insert_arxiv_stats(paper_id, stats)
-            
-            logger.info(f"Worker {worker_id}: Successfully stored arXiv paper {paper_data['paper_id']}")
+            # Insert statistics (resilient)
+            try:
+                stats_data = {
+                    'word_count': paper_data.get('word_count', 0),
+                    'abstract_length': paper_data.get('abstract_length', 0),
+                    'title_length': paper_data.get('title_length', 0),
+                    'num_authors': paper_data.get('num_authors', 0),
+                    'num_keywords': paper_data.get('num_keywords', 0)
+                }
+                insert_arxiv_stats(paper_id, stats_data)
+            except Exception as e:
+                logger.warning(f"Worker {worker_id}: Failed to insert ArXiv stats: {e}")
+                
+            logger.info(f"Worker {worker_id}: Successfully stored ArXiv data for paper {paper_id}")
             return paper_id
         else:
-            logger.error(f"Worker {worker_id}: Failed to insert arXiv paper {paper_data['paper_id']}")
+            logger.error(f"Worker {worker_id}: Failed to insert ArXiv paper")
             return None
             
     except Exception as e:
-        logger.error(f"Worker {worker_id}: Error storing arXiv data: {e}")
+        logger.error(f"Worker {worker_id}: Database error storing ArXiv data: {e}")
         return None
-
-def calculate_readability(text):
-    """Simple readability score calculation"""
-    if not text:
-        return 0
-    
-    sentences = text.split('.')
-    words = text.split()
-    
-    if len(sentences) == 0:
-        return 0
-    
-    avg_words_per_sentence = len(words) / len(sentences)
-    avg_chars_per_word = sum(len(word) for word in words) / len(words) if words else 0
-    
-    # Simple readability formula (inverse of words per sentence + chars per word)
-    readability = 100 - (1.015 * avg_words_per_sentence) - (84.6 * (avg_chars_per_word / 4.7))
-    return max(0, min(100, readability))
-
-# Maintenance tasks
-@app.task(name='maintenance_tasks.cleanup_old_logs')
-def cleanup_old_logs():
-    """Clean up old logs from Redis"""
-    try:
-        logger = init_logger(redis_client)
-        logger.cleanup_old_entries(days=7)
-        return {'status': 'completed', 'message': 'Old logs cleaned up'}
-    except Exception as e:
-        logger.error(f"Error cleaning up logs: {e}")
-        return {'status': 'failed', 'error': str(e)}
-
-@app.task(name='maintenance_tasks.update_stats')
-def update_stats():
-    """Update crawler statistics"""
-    try:
-        from db_sqlalchemy import update_crawler_stats
-        from models import get_db_session, Paper, CrawlerStats
-        
-        session = get_db_session()
-        
-        # Count papers
-        total_papers = session.query(Paper).count()
-        completed_papers = session.query(Paper).filter_by(status='completed').count()
-        
-        # Update stats
-        stats_data = {
-            'total_pages_crawled': completed_papers,
-            'total_urls_discovered': total_papers,
-            'active_workers': len(redis_client.smembers('active_workers')),
-            'error_count': redis_client.get('error_count') or 0
-        }
-        
-        update_crawler_stats(stats_data)
-        session.close()
-        
-        return {'status': 'completed', 'stats': stats_data}
-    except Exception as e:
-        logger.error(f"Error updating stats: {e}")
-        return {'status': 'failed', 'error': str(e)}
+    finally:
+        if session:
+            session.close()

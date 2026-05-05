@@ -9,6 +9,7 @@ lxml==4.9.3
 scrapy==2.8.0
 sqlalchemy==2.0.20
 pymysql==1.1.0
+cryptography>=3.4.8
 celery==5.3.1
 pandas==2.0.3
 matplotlib==3.7.2

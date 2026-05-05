@@ -11,7 +11,14 @@ class DistributedBloomFilter:
     """Distributed bloom filter using Redis for efficient duplicate detection"""
     
     def __init__(self, redis_client, capacity=1000000, error_rate=0.001):
-        self.r = redis_client
+        # Create a separate Redis client for binary data (no decode_responses)
+        self.r_binary = redis.Redis(
+            host=redis_client.connection_pool.connection_kwargs.get('host', 'localhost'),
+            port=redis_client.connection_pool.connection_kwargs.get('port', 6379),
+            db=redis_client.connection_pool.connection_kwargs.get('db', 0),
+            password=redis_client.connection_pool.connection_kwargs.get('password'),
+            decode_responses=False  # Keep binary data for pickle
+        )
         self.capacity = capacity
         self.error_rate = error_rate
         self.local_filter = None
@@ -21,8 +28,8 @@ class DistributedBloomFilter:
     def _load_or_create_filter(self):
         """Load existing bloom filter from Redis or create new one"""
         try:
-            # Try to load from Redis
-            filter_data = self.r.get(self.redis_key)
+            # Try to load from Redis (binary client)
+            filter_data = self.r_binary.get(self.redis_key)
             if filter_data:
                 self.local_filter = pickle.loads(filter_data)
                 logger.info(f"Loaded bloom filter from Redis with {self.capacity} capacity")
@@ -39,7 +46,7 @@ class DistributedBloomFilter:
         """Save bloom filter to Redis"""
         try:
             filter_data = pickle.dumps(self.local_filter)
-            self.r.set(self.redis_key, filter_data)
+            self.r_binary.set(self.redis_key, filter_data)
         except Exception as e:
             logger.error(f"Error saving bloom filter to Redis: {e}")
     

@@ -1,21 +1,14 @@
 #!/usr/bin/env python3
 """
-Distributed Web Crawler - Main Orchestrator
-A comprehensive distributed web crawler with advanced features including:
-- Distributed architecture with multiple workers
-- URL queue management with priority system
-- Duplicate detection using bloom filters
-- Robots.txt compliance and rate limiting
-- Structured data extraction and storage
-- Real-time monitoring and logging
+Distributed Web Crawler - Main Orchestrator (Refactored for Celery)
+A comprehensive distributed web crawler that uses Celery for task distribution.
+This version acts strictly as a producer, submitting tasks to Celery workers.
 """
 
 import sys
 import time
 import signal
 import argparse
-import threading
-import subprocess
 from pathlib import Path
 
 # Add scripts directory to path
@@ -24,14 +17,10 @@ sys.path.append(str(Path(__file__).parent / "scripts"))
 import redis
 from config import ConfigManager, get_config
 from logger import init_logger, get_logger
-from url_queue import QueueManager
-from general_crawler import GeneralWebCrawler
-from scripts.producer import main as arxiv_producer_main
-from scripts.worker import main as arxiv_worker_main
-from scripts.db import get_connection
+from crawler_tasks import batch_crawl_task
 
 class DistributedCrawler:
-    """Main distributed crawler orchestrator"""
+    """Main distributed crawler orchestrator using Celery"""
     
     def __init__(self, config_file=None):
         # Load configuration
@@ -59,19 +48,11 @@ class DistributedCrawler:
         self.logger = init_logger(self.redis_client, self.config.logging.__dict__)
         print("✓ Logger initialized")
         
-        # Initialize components
-        self.queue_manager = QueueManager(self.redis_client)
-        self.crawler = GeneralWebCrawler(self.redis_client, self.config.crawler.__dict__)
-        
-        # Worker management
-        self.workers = []
-        self.running = False
-        
         # Setup signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
         
-        print("✓ Distributed crawler initialized")
+        print("✓ Distributed crawler initialized (Celery-based)")
     
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals"""
@@ -80,107 +61,48 @@ class DistributedCrawler:
         sys.exit(0)
     
     def add_seed_urls(self, urls):
-        """Add seed URLs to start crawling"""
-        added_count = 0
+        """Add seed URLs to start crawling via Celery"""
+        print(f"Submitting {len(urls)} seed URLs to Celery...")
         
-        for url in urls:
-            priority = self.config_manager.calculate_priority(url, url)
-            if self.queue_manager.url_queue.add_url(url, priority):
-                added_count += 1
+        # Submit batch crawl task to Celery
+        task_result = batch_crawl_task.delay(urls)
         
-        print(f"✓ Added {added_count} seed URLs to queue")
-        return added_count
+        print(f"✓ Submitted batch crawl task: {task_result.id}")
+        print(f"✓ Task status: {task_result.status}")
+        
+        return task_result
     
-    def start_workers(self, num_workers=None):
-        """Start crawler worker processes"""
-        num_workers = num_workers or self.config.crawler.max_workers
-        print(f"Starting {num_workers} worker processes...")
+    def monitor_celery_tasks(self):
+        """Monitor Celery task progress"""
+        print("Starting Celery task monitoring...")
         
-        # Set crawler running flag
-        self.redis_client.set('crawler_running', '1')
-        
-        for i in range(num_workers):
-            worker_script = Path(__file__).parent / "scripts" / "standalone_worker.py"
-            cmd = [sys.executable, str(worker_script), str(i)]
-            
-            if self.config_manager.config_file:
-                cmd.extend(['--config', self.config_manager.config_file])
-            
-            worker = subprocess.Popen(cmd)
-            self.workers.append(worker)
-            print(f"✓ Started worker {i}")
-        
-        self.running = True
-        print(f"✓ All {num_workers} workers started")
-    
-    
-    
-    def start_arxiv_crawler(self):
-        """Start the arXiv-specific crawler (legacy functionality)"""
-        print("Starting arXiv crawler...")
-        
-        # Start arXiv producer in separate thread
-        producer_thread = threading.Thread(
-            target=arxiv_producer_main,
-            name="ArxivProducer"
-        )
-        producer_thread.start()
-        
-        # Start arXiv workers
-        arxiv_workers = []
-        for i in range(2):  # 2 arXiv workers
-            worker = multiprocessing.Process(
-                target=arxiv_worker_main,
-                name=f"ArxivWorker-{i}"
-            )
-            worker.start()
-            arxiv_workers.append(worker)
-        
-        return producer_thread, arxiv_workers
-    
-    def monitor_system(self):
-        """System monitoring dashboard"""
-        while self.running:
-            try:
-                stats = self.queue_manager.get_dashboard_stats()
-                logger_stats = get_logger().get_stats()
+        try:
+            while True:
+                # Get task statistics from Redis
+                try:
+                    # Celery stores task stats in Redis
+                    stats = self.redis_client.hgetall('celery-stats')
+                    if stats:
+                        print(f"\nCelery Stats: {stats}")
+                except:
+                    pass
                 
-                print("\n" + "="*60)
-                print("DISTRIBUTED CRAWLER DASHBOARD")
-                print("="*60)
-                print(f"Active Workers: {len(self.workers)}")
-                print(f"Queue Size: {stats['queue']['total_urls']}")
-                print(f"  - High Priority: {stats['queue']['high_priority']}")
-                print(f"  - Medium Priority: {stats['queue']['medium_priority']}")
-                print(f"  - Low Priority: {stats['queue']['low_priority']}")
-                print(f"Pages Crawled: {logger_stats.get('pages_crawled', 0)}")
-                print(f"Errors: {logger_stats.get('errors', 0)}")
-                print(f"Active Domains: {stats['domains_active']}")
-                print("="*60)
+                # Check active tasks
+                try:
+                    active_tasks = self.redis_client.lrange('celery', 0, -1)
+                    if active_tasks:
+                        print(f"Active tasks in queue: {len(active_tasks)}")
+                except:
+                    pass
                 
                 time.sleep(30)  # Update every 30 seconds
                 
-            except KeyboardInterrupt:
-                break
-            except Exception as e:
-                print(f"Monitor error: {e}")
-                time.sleep(10)
+        except KeyboardInterrupt:
+            print("\nMonitoring stopped...")
     
     def shutdown(self):
         """Graceful shutdown"""
         print("Shutting down distributed crawler...")
-        self.running = False
-        
-        # Signal workers to stop
-        self.redis_client.delete('crawler_running')
-        
-        # Wait for workers to finish
-        for worker in self.workers:
-            try:
-                worker.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                worker.terminate()
-                worker.wait()
         
         # Flush logs
         if get_logger():
@@ -188,9 +110,9 @@ class DistributedCrawler:
         
         print("✓ Shutdown complete")
     
-    def run(self, seed_urls=None, num_workers=None, enable_monitoring=True):
-        """Main run method"""
-        print("Starting distributed web crawler...")
+    def run(self, seed_urls=None, enable_monitoring=True):
+        """Main run method - acts as Celery producer"""
+        print("Starting distributed web crawler (Celery producer)...")
         
         # Add seed URLs
         if seed_urls:
@@ -200,36 +122,28 @@ class DistributedCrawler:
             default_seeds = [
                 'https://en.wikipedia.org/wiki/Artificial_intelligence',
                 'https://github.com/topics/machine-learning',
-                'https://arxiv.org/list/cs/recent'
+                'https://arxiv.org/list/cs/recent',
+                'https://httpbin.org/html',
+                'https://example.com'
             ]
             self.add_seed_urls(default_seeds)
         
-        # Start workers
-        self.start_workers(num_workers)
+        print("✓ URLs submitted to Celery for processing")
+        print("✓ Make sure Celery workers are running: celery -A celery_app worker --loglevel=info")
         
         # Start monitoring if enabled
         if enable_monitoring:
-            monitor_thread = threading.Thread(target=self.monitor_system, daemon=True)
-            monitor_thread.start()
-        
-        try:
-            # Keep main thread alive
-            while self.running:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            print("\nShutdown requested...")
-        finally:
-            self.shutdown()
+            self.monitor_celery_tasks()
+        else:
+            print("Monitoring disabled. Check Celery worker logs for progress.")
 
 
 def main():
     """Main entry point"""
-    parser = argparse.ArgumentParser(description='Distributed Web Crawler')
+    parser = argparse.ArgumentParser(description='Distributed Web Crawler (Celery-based)')
     parser.add_argument('--config', '-c', help='Configuration file path')
-    parser.add_argument('--workers', '-w', type=int, help='Number of worker processes')
     parser.add_argument('--seeds', '-s', nargs='+', help='Seed URLs to start crawling')
-    parser.add_argument('--arxiv', action='store_true', help='Run arXiv crawler only')
-    parser.add_argument('--no-monitor', action='store_true', help='Disable monitoring dashboard')
+    parser.add_argument('--no-monitor', action='store_true', help='Disable Celery task monitoring')
     parser.add_argument('--setup-db', action='store_true', help='Setup database schema')
     
     args = parser.parse_args()
@@ -238,26 +152,17 @@ def main():
     if args.setup_db:
         print("Setting up database schema...")
         print("Please run: mysql -u root -p < schema.sql")
+        print("Then run: python -c \"from models import db_manager; db_manager.create_tables()\"")
         return
     
     # Initialize crawler
     crawler = DistributedCrawler(args.config)
     
-    if args.arxiv:
-        # Run arXiv crawler only
-        producer_thread, arxiv_workers = crawler.start_arxiv_crawler()
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            print("\nShutting down arXiv crawler...")
-    else:
-        # Run general distributed crawler
-        crawler.run(
-            seed_urls=args.seeds,
-            num_workers=args.workers,
-            enable_monitoring=not args.no_monitor
-        )
+    # Run general distributed crawler (Celery producer only)
+    crawler.run(
+        seed_urls=args.seeds,
+        enable_monitoring=not args.no_monitor
+    )
 
 
 if __name__ == "__main__":

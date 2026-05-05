@@ -19,7 +19,7 @@ class PaperStatus(enum.Enum):
     FAILED = "failed"
 
 class Paper(Base):
-    """ORM model for papers table"""
+    """ORM model for papers table (general crawler)"""
     __tablename__ = 'papers'
     
     id = Column(Integer, primary_key=True)
@@ -33,16 +33,11 @@ class Paper(Base):
     crawl_date = Column(DateTime, default=func.now())
     last_updated = Column(DateTime, default=func.now(), onupdate=func.now())
     
-    # Legacy arXiv fields (for backward compatibility)
-    paper_id = Column(String(50), unique=True)  # arXiv ID
-    abstract = Column(Text)
-    primary_subject = Column(String(255))
-    submission_info = Column(Text)
-    
     # Relationships
     authors = relationship("PaperAuthor", back_populates="paper")
     keywords = relationship("PaperKeyword", back_populates="paper")
     subjects = relationship("PaperSubject", back_populates="paper")
+    categories = relationship("PaperCategory", back_populates="paper")
     stats = relationship("PaperStats", back_populates="paper", uselist=False)
     discovered_links = relationship("DiscoveredLink", foreign_keys="DiscoveredLink.source_url", primaryjoin="DiscoveredLink.source_url==Paper.url")
 
@@ -134,6 +129,27 @@ class DiscoveredLink(Base):
     anchor_text = Column(String(500))
     discovered_date = Column(DateTime, default=func.now())
 
+class Category(Base):
+    """ORM model for categories table"""
+    __tablename__ = 'categories'
+    
+    id = Column(Integer, primary_key=True)
+    name = Column(String(255), nullable=False, unique=True)
+    
+    # Relationships
+    papers = relationship("PaperCategory", back_populates="category")
+
+class PaperCategory(Base):
+    """ORM model for paper_categories relationship table"""
+    __tablename__ = 'paper_categories'
+    
+    paper_id = Column(Integer, ForeignKey('papers.id'), primary_key=True)
+    category_id = Column(Integer, ForeignKey('categories.id'), primary_key=True)
+    
+    # Relationships
+    paper = relationship("Paper", back_populates="categories")
+    category = relationship("Category", back_populates="papers")
+
 class CrawlerStats(Base):
     """ORM model for crawler_stats table"""
     __tablename__ = 'crawler_stats'
@@ -193,9 +209,19 @@ class ArxivDatabaseManager:
     def get_session(self):
         """Get a new arXiv database session"""
         return self.SessionLocal()
+    
+    def create_tables(self):
+        """Create arXiv database tables"""
+        ArxivBase.metadata.create_all(bind=self.engine)
+    
+    def drop_tables(self):
+        """Drop arXiv database tables"""
+        ArxivBase.metadata.drop_all(bind=self.engine)
 
 # Legacy arXiv models (for backward compatibility)
-class ArxivPaper(Base):
+ArxivBase = declarative_base()
+
+class ArxivPaper(ArxivBase):
     """ORM model for arXiv papers table"""
     __tablename__ = 'papers'
     
@@ -213,7 +239,7 @@ class ArxivPaper(Base):
     keywords = relationship("ArxivPaperKeyword", back_populates="paper")
     stats = relationship("ArxivPaperStats", back_populates="paper", uselist=False)
 
-class ArxivAuthor(Base):
+class ArxivAuthor(ArxivBase):
     """ORM model for arXiv authors table"""
     __tablename__ = 'authors'
     
@@ -223,7 +249,7 @@ class ArxivAuthor(Base):
     # Relationships
     papers = relationship("ArxivPaperAuthor", back_populates="author")
 
-class ArxivPaperAuthor(Base):
+class ArxivPaperAuthor(ArxivBase):
     """ORM model for arXiv paper_authors relationship table"""
     __tablename__ = 'paper_authors'
     
@@ -234,7 +260,7 @@ class ArxivPaperAuthor(Base):
     paper = relationship("ArxivPaper", back_populates="authors")
     author = relationship("ArxivAuthor", back_populates="papers")
 
-class ArxivSubject(Base):
+class ArxivSubject(ArxivBase):
     """ORM model for arXiv subjects table"""
     __tablename__ = 'subjects'
     
@@ -244,7 +270,7 @@ class ArxivSubject(Base):
     # Relationships
     papers = relationship("ArxivPaperSubject", back_populates="subject")
 
-class ArxivPaperSubject(Base):
+class ArxivPaperSubject(ArxivBase):
     """ORM model for arXiv paper_subjects relationship table"""
     __tablename__ = 'paper_subjects'
     
@@ -255,7 +281,7 @@ class ArxivPaperSubject(Base):
     paper = relationship("ArxivPaper", back_populates="subjects")
     subject = relationship("ArxivSubject", back_populates="papers")
 
-class ArxivKeyword(Base):
+class ArxivKeyword(ArxivBase):
     """ORM model for arXiv keywords table"""
     __tablename__ = 'keywords'
     
@@ -265,7 +291,7 @@ class ArxivKeyword(Base):
     # Relationships
     papers = relationship("ArxivPaperKeyword", back_populates="keyword")
 
-class ArxivPaperKeyword(Base):
+class ArxivPaperKeyword(ArxivBase):
     """ORM model for arXiv paper_keywords relationship table"""
     __tablename__ = 'paper_keywords'
     
@@ -276,7 +302,7 @@ class ArxivPaperKeyword(Base):
     paper = relationship("ArxivPaper", back_populates="keywords")
     keyword = relationship("ArxivKeyword", back_populates="papers")
 
-class ArxivPaperStats(Base):
+class ArxivPaperStats(ArxivBase):
     """ORM model for arXiv paper_stats table"""
     __tablename__ = 'paper_stats'
     
