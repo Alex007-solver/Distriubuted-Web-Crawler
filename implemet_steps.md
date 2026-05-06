@@ -98,4 +98,81 @@ The **`&`** at the end runs commands in the background so you can run multiple w
 
 ---
 
+---
+
+## 🗄️ **How to Start SQL and Redis Servers**
+
+### **Starting MySQL Server**
+```bash
+# On macOS with Homebrew
+brew services start mysql
+
+# Alternative: Start manually
+mysql.server start
+
+# Check if MySQL is running
+brew services list | grep mysql
+# Should show: mysql started
+```
+
+### **Starting Redis Server**
+```bash
+# Start Redis server
+redis-server
+
+# Check if Redis is running
+redis-cli ping
+# Should return: PONG
+
+# Alternative: Start Redis in background
+redis-server --daemonize yes
+```
+
+### **Starting Both Servers Together**
+```bash
+# Start both services
+brew services start mysql
+redis-server
+
+# Verify both are running
+mysql -u root -p -e "SELECT 1;" && redis-cli ping
+# Should show success for both
+```
+
+### **Database Setup (First Time Only)**
+```bash
+# Create databases and user
+mysql -u root -p < schema.sql
+
+# Verify databases exist
+mysql -u root -p -e "SHOW DATABASES;"
+# Should show: crawler_db, arxiv_db
+```
+
+### **Server Status Check**
+```bash
+# Check MySQL status
+brew services list | grep mysql
+
+# Check Redis status
+redis-cli info server | head -5
+
+# Check both at once
+echo "MySQL:" && brew services list | grep mysql && echo "Redis:" && redis-cli ping
+```
+
+### **Stopping Servers**
+```bash
+# Stop MySQL
+brew services stop mysql
+
+# Stop Redis
+redis-cli shutdown
+
+# Stop both
+brew services stop mysql && redis-cli shutdown
+```
+
+---
+
 **Try these steps and let me know if you get stuck at any specific step!**
