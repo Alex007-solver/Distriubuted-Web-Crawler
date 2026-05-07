@@ -17,6 +17,7 @@ from celery_app import app
 from config import ConfigManager
 from logger import init_logger, get_logger
 from general_crawler import GeneralWebCrawler
+from models import PaperStatus
 from db_sqlalchemy import (
     insert_paper, insert_keyword, link_paper_keyword, insert_stats, insert_discovered_link,
     insert_arxiv_paper, insert_arxiv_author, link_arxiv_paper_author,
@@ -323,7 +324,7 @@ def store_crawled_data(result: Dict[str, Any], worker_id: str) -> Optional[int]:
             'content': result['content'],
             'content_hash': result['content_hash'],
             'domain': result['metadata']['domain'],
-            'status': 'COMPLETED',  # Fix: Use uppercase enum value
+            'status': PaperStatus.COMPLETED.value,  # Fix: Use proper enum value
             'priority': 50,
             'crawl_date': datetime.fromtimestamp(result['crawl_date'])
         }
